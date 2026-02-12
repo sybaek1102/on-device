@@ -8,7 +8,7 @@ __pycache__/
 
 # Distribution / packaging
 .Python
-build/
+# build/  # Commented out: our build/ folder contains source code, not build artifacts
 develop-eggs/
 dist/
 downloads/
