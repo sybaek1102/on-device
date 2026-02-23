@@ -1,0 +1,19 @@
+{
+  "creation_date": "2026022007",
+  "index_type": "IndexHNSWPQ",
+  "pq_m": 16,
+  "pq_nbits": 8,
+  "hnsw_m": 32,
+  "hnsw_ef_construction": 80,
+  "base_hnswpq": {
+    "train_time_ms": 0.0,
+    "add_time_ms": 0.0,
+    "total_time_ms": 0.0
+  },
+  "residual_pq": {
+    "train_time_ms": 15140.145,
+    "add_time_ms": 11256.064,
+    "total_time_ms": 26396.209
+  },
+  "total_build_time_ms": 26396.209
+}

@@ -1,0 +1,66 @@
+{
+  "name": "all_hnsw",
+  "creation_date": "2026022007",
+  "eval_fold": 1,
+  "query_range": [
+    0,
+    999
+  ],
+  "num_query": 1000,
+  "candidates": 16,
+  "latency": {
+    "total_ms": 7212.715,
+    "query_search_total_ms": 379.07,
+    "query_search_avg_ms": 0.37907,
+    "query_search_min_ms": 0.196151,
+    "query_search_max_ms": 5.587622,
+    "re_ranking_total_ms": 3972.871,
+    "re_ranking_avg_ms": 3.972871,
+    "re_ranking_min_ms": 0.427904,
+    "re_ranking_max_ms": 7.827371
+  },
+  "disk_io": {
+    "index_load_bytes": 2888732672,
+    "search_and_reranking_bytes": 3326849024,
+    "total_io_bytes": 6215581696
+  },
+  "memory_mb": {
+    "before_index_load": 100.62,
+    "after_index_load": 2854.38,
+    "index_load_delta": 2753.75,
+    "after_search": 3740.49,
+    "search_delta": 886.11,
+    "peak": 8008.84
+  },
+  "metrics": {
+    "recall_at_1": 0.831,
+    "mrr": 0.902599,
+    "distance_ratio": 0.988663
+  },
+  "histogram": {
+    "mrr": {
+      "<=0.1": 4,
+      "<=0.2": 17,
+      "<=0.3": 22,
+      "<=0.4": 55,
+      "<=0.5": 169,
+      "<=0.6": 169,
+      "<=0.7": 169,
+      "<=0.8": 169,
+      "<=0.9": 169,
+      "<=1.0": 1000
+    },
+    "distance_ratio": {
+      "<=0.1": 0,
+      "<=0.2": 0,
+      "<=0.3": 0,
+      "<=0.4": 0,
+      "<=0.5": 0,
+      "<=0.6": 0,
+      "<=0.7": 0,
+      "<=0.8": 8,
+      "<=0.9": 43,
+      "<=1.0": 1000
+    }
+  }
+}

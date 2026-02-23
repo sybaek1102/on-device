@@ -1,0 +1,11 @@
+{
+  "creation_date": "2026022007",
+  "pq_m": 32,
+  "pq_nbits": 8,
+  "base_pq": {
+    "train_time_ms": 19621.342,
+    "add_time_ms": 15242.906,
+    "total_time_ms": 34864.248
+  },
+  "total_build_time_ms": 34864.248
+}

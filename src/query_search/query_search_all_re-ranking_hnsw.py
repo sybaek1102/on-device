@@ -1,0 +1,404 @@
+#!/usr/bin/env python3
+"""
+query_search_all_re-ranking_hnsw.py
+─────────────────────────────────────
+HNSWPQ Index로 top-16 후보를 뽑은 뒤, 실제 L2 거리로 re-ranking해 top-1을 반환합니다.
+쿼리를 하나씩 순차 처리합니다 (on-device 환경 가정).
+
+[Re-ranking 방식]
+  - bigann_base10M.fvecs에서 후보 벡터를 직접 읽어 실제 L2 거리 계산
+  - memmap으로 접근 → re-ranking 중 실제 disk I/O 측정 가능
+
+[측정 항목]
+  - total_latency_ms
+  - query_search_latency_ms   (전체 / 평균)
+  - re_ranking_latency_ms     (전체 / 평균)
+  - disk_io_bytes             (index 로딩 / 검색 / re-ranking 각각)
+  - memory_mb                 (index 로딩 전후 / 검색 후)
+  - recall@1
+  - MRR
+  - Distance Ratio
+  - MRR / Distance Ratio 구간별 히스토그램 (0.1 단위)
+
+[저장]
+  output/metric/{name}_query_search.json
+"""
+
+import faiss
+faiss.omp_set_num_threads(1)   # on-device: 단일 스레드 가정
+
+import numpy as np
+import os
+import time
+import json
+import subprocess
+
+# =============================================================================
+# 🔹 Configuration
+# =============================================================================
+CREATION_DATE  = "2026022007"
+NAME           = "all_hnsw"     # JSON 파일명 prefix
+
+# =============================================================================
+# 🔹 K-Fold 평가 설정
+#    EVAL_FOLD : 1~10 중 하나를 지정하면 해당 fold의 쿼리 구간(1,000개)만 실행
+#                → selective / no 스크립트와 동일 쿼리셋으로 공평한 비교 가능
+# =============================================================================
+EVAL_FOLD  = 1           # 1~10 (1-indexed)
+NUM_FOLDS  = 10
+
+DATA_DIR   = "/home/syback/vectorDB/ann_datasets/sift1B"
+QUERY_FILE = os.path.join(DATA_DIR, "bigann_query.bvecs")
+GT_FILE    = os.path.join(DATA_DIR, "gnd", "idx_10M.ivecs")
+
+# 10M base 원본 벡터 (fvecs) — re-ranking 시 실제 L2 계산에 사용
+BASE10M_FILE = "/home/syback/vectorDB/on-device/data/raw/bigann_base10M.fvecs"
+
+INDEX_DIR     = "/home/syback/vectorDB/on-device/data/index"
+HNSW_EF_SEARCH = 64           # HNSW 검색 품질 (Ŀ을수록 Recall↑, 속도↓)
+PQ_INDEX_PATH = os.path.join(INDEX_DIR, f"{CREATION_DATE}_hnswpq.index")
+
+METRIC_DIR    = "/home/syback/vectorDB/on-device/output/metric"
+METRIC_PATH   = os.path.join(METRIC_DIR, f"{NAME}_query_search_fold{EVAL_FOLD}.json")
+TIMINGS_PATH  = os.path.join(METRIC_DIR, f"{NAME}_query_timings_fold{EVAL_FOLD}.json")
+
+NUM_QUERY_TOTAL  = 10_000
+QUERIES_PER_FOLD = NUM_QUERY_TOTAL // NUM_FOLDS   # 1,000
+Q_START   = (EVAL_FOLD - 1) * QUERIES_PER_FOLD    # inclusive
+Q_END     = EVAL_FOLD * QUERIES_PER_FOLD           # exclusive
+NUM_QUERY = QUERIES_PER_FOLD                       # 이번 실행에서 처리할 쿼리 수
+
+CANDIDATES  = 16        # top-K for re-ranking
+DIM         = 128
+
+# =============================================================================
+# 🔹 Helper Functions
+# =============================================================================
+def load_bvecs(fname, num_vectors=None):
+    with open(fname, "rb") as f:
+        d = np.frombuffer(f.read(4), dtype="int32")[0]
+    filesize    = os.path.getsize(fname)
+    record_size = 4 + d
+    total       = filesize // record_size
+    if num_vectors is not None:
+        num_vectors = min(num_vectors, total)
+    else:
+        num_vectors = total
+    mm   = np.memmap(fname, dtype="uint8", mode="r")
+    mm   = mm[: num_vectors * record_size]
+    data = mm.reshape(num_vectors, record_size)[:, 4:]
+    return data.astype("float32")
+
+def load_ivecs(fname):
+    mm          = np.memmap(fname, dtype="int32", mode="r")
+    k           = mm[0]
+    record_size = k + 1
+    nvecs       = mm.shape[0] // record_size
+    return mm.reshape(nvecs, record_size)[:, 1:].copy()
+
+def open_fvecs_memmap(fname):
+    """fvecs 파일을 memmap으로 열어 (N, D) float32 배열처럼 접근"""
+    with open(fname, "rb") as f:
+        d = np.frombuffer(f.read(4), dtype="int32")[0]
+    filesize    = os.path.getsize(fname)
+    record_size = (1 + d) * 4    # 4 bytes per float32 (dim header + D floats)
+    total       = filesize // record_size
+    # 전체 파일을 float32 memmap으로 열기
+    raw = np.memmap(fname, dtype="float32", mode="r")
+    # (N, 1+D) reshape 후 dim header 제거
+    raw = raw.reshape(total, 1 + d)[:, 1:]
+    return raw   # (N, D), on-demand disk read
+
+def get_io_bytes():
+    """현재 프로세스의 누적 read I/O bytes (Linux /proc 기반)"""
+    try:
+        with open(f"/proc/{os.getpid()}/io", "r") as f:
+            for line in f:
+                if line.startswith("read_bytes:"):
+                    return int(line.split()[1])
+    except Exception:
+        pass
+    return 0
+
+def get_rss_mb():
+    """현재 프로세스의 RSS 메모리 반환 (MB)"""
+    try:
+        with open(f"/proc/{os.getpid()}/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024
+    except Exception:
+        pass
+    return 0.0
+
+def get_peak_mb():
+    """현재 프로세스의 Peak RSS 반환 (MB)"""
+    try:
+        with open(f"/proc/{os.getpid()}/status") as f:
+            for line in f:
+                if line.startswith("VmPeak:"):
+                    return int(line.split()[1]) / 1024
+    except Exception:
+        pass
+    return 0.0
+
+def drop_cache():
+    """OS 페이지 캐시 비우기 (sudo 필요)"""
+    try:
+        result = subprocess.run(
+            ["sudo", "sh", "-c", "sync && echo 3 > /proc/sys/vm/drop_caches"],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            print("    ✓ 페이지 캐시 drop 완료")
+        else:
+            print(f"    ⚠ 캐시 drop 실패 (sudo 권한 필요): {result.stderr.strip()}")
+    except Exception as e:
+        print(f"    ⚠ 캐시 drop 건너뜀: {e}")
+
+def histogram_counts(values, bins):
+    result = {}
+    for b in bins:
+        key = f"<={b:.1f}"
+        result[key] = int(np.sum(values <= b))
+    return result
+
+# =============================================================================
+# 🔹 Main
+# =============================================================================
+if __name__ == "__main__":
+    BINS = [round(0.1 * i, 1) for i in range(1, 11)]   # 0.1 ~ 1.0
+
+    print("=" * 70)
+    print(f"  Query Search — All Re-ranking  (name='{NAME}')")
+    print("=" * 70)
+
+    total_start = time.perf_counter()
+
+    # -------------------------------------------------------------------------
+    # Step 1. 데이터 로드 (Query, GT)
+    # -------------------------------------------------------------------------
+    print("\n>>> [1/5] 데이터 로드 (Query, GT)")
+    print(f"    - EVAL_FOLD : {EVAL_FOLD}  (쿼리 {Q_START}~{Q_END-1}, {NUM_QUERY}개)")
+    xq_all  = load_bvecs(QUERY_FILE, Q_END)
+    xq      = xq_all[Q_START:]          # (NUM_QUERY, 128)
+    gt_all  = load_ivecs(GT_FILE)
+    gt      = gt_all[Q_START:Q_END]     # (NUM_QUERY, k_gt)
+    gt_top1 = gt[:, 0]
+    del xq_all, gt_all
+    print(f"    - Query : {xq.shape}")
+    print(f"    - GT    : {gt.shape}")
+
+    # -------------------------------------------------------------------------
+    # Step 2. OS 페이지 캐시 비우기 + Index & Base10M memmap 준비
+    # -------------------------------------------------------------------------
+    print("\n>>> [2/5] OS 페이지 캐시 비우기...")
+    drop_cache()
+
+    print("\n    PQ Index 로드 중...")
+    io_before_index  = get_io_bytes()
+    mem_before_index = get_rss_mb()
+    index_load_start = time.perf_counter()
+
+    index = faiss.read_index(PQ_INDEX_PATH)
+    index.hnsw.efSearch = HNSW_EF_SEARCH   # 검색 품질 설정
+
+    index_load_end  = time.perf_counter()
+    io_after_index  = get_io_bytes()
+    mem_after_index = get_rss_mb()
+
+    index_load_ms  = (index_load_end - index_load_start) * 1000
+    io_index_bytes = io_after_index - io_before_index
+    print(f"    - Index ntotal    : {index.ntotal:,}")
+    print(f"    - Load time       : {index_load_ms:.1f} ms")
+    print(f"    - I/O (index)     : {io_index_bytes:,} bytes")
+    print(f"    - efSearch        : {HNSW_EF_SEARCH}")
+    print(f"    - Mem before load : {mem_before_index:.1f} MB")
+    print(f"    - Mem after load  : {mem_after_index:.1f} MB  (+{mem_after_index - mem_before_index:.1f} MB)")
+
+    # Base10M memmap 열기 (메모리에 올리지 않고 on-demand 접근)
+    print("\n    Base10M fvecs memmap 열기...")
+    base10m = open_fvecs_memmap(BASE10M_FILE)   # (10M, 128), memmap
+    print(f"    - Base10M shape   : {base10m.shape}  (memmap, not in RAM)")
+
+    # -------------------------------------------------------------------------
+    # Step 3. 쿼리별 순차 검색 + Re-ranking
+    # -------------------------------------------------------------------------
+    print(f"\n>>> [3/5] 쿼리 {NUM_QUERY}개 순차 검색 + Re-ranking 중...")
+
+    search_latencies   = []   # PQ search latency (ms)
+    rerank_latencies   = []   # re-ranking latency (ms)
+    returned_ids       = []   # re-ranking 후 최종 top-1 index
+    t_io_list          = []   # 쿼리별 T_IO: base10m 접근 + L2 계산 시간 (ms)
+
+    io_before_search  = get_io_bytes()
+    mem_before_search = get_rss_mb()
+
+    for i in range(NUM_QUERY):
+        q = xq[i : i + 1]   # (1, 128)
+
+        # --- PQ Search (top-16) ---
+        t_s = time.perf_counter()
+        _, I = index.search(q, CANDIDATES)
+        t_e = time.perf_counter()
+        search_latencies.append((t_e - t_s) * 1000)
+
+        cand_ids = I[0]      # (16,) top-16 candidate indices
+
+        # --- Re-ranking: 실제 L2 거리로 재정렬 ---
+        t_r0 = time.perf_counter()
+
+        # memmap에서 후보 벡터 읽기 (여기서 disk I/O 발생 가능)
+        cand_vecs = base10m[cand_ids]                       # (16, 128), float32
+        q_vec     = xq[i]                                   # (128,)
+        dists     = np.sum((cand_vecs - q_vec) ** 2, axis=1)  # (16,) L2²
+        best      = int(cand_ids[np.argmin(dists)])         # re-ranked top-1
+
+        t_r1 = time.perf_counter()
+        t_io_ms = (t_r1 - t_r0) * 1000
+        rerank_latencies.append(t_io_ms)
+        t_io_list.append(round(t_io_ms, 6))
+
+        returned_ids.append(best)
+
+    io_after_search  = get_io_bytes()
+    io_search_total  = io_after_search - io_before_search   # 검색+re-ranking 합산
+    mem_after_search = get_rss_mb()
+    mem_peak         = get_peak_mb()
+
+    search_latencies = np.array(search_latencies,  dtype=np.float64)
+    rerank_latencies = np.array(rerank_latencies,  dtype=np.float64)
+    returned_ids     = np.array(returned_ids,      dtype=np.int64)
+
+    print(f"    - PQ Search (avg)     : {search_latencies.mean():.4f} ms")
+    print(f"    - Re-ranking (avg)    : {rerank_latencies.mean():.4f} ms")
+    print(f"    - I/O (search+rerank) : {io_search_total:,} bytes")
+
+    # -------------------------------------------------------------------------
+    # Step 4. 메트릭 계산
+    # -------------------------------------------------------------------------
+    print("\n>>> [4/5] 메트릭 계산 중...")
+
+    # base10m은 실제 L2 계산에 계속 사용
+    recall_arr  = (returned_ids == gt_top1).astype(np.float32)
+    recall_at_1 = float(recall_arr.mean())
+
+    mrr_values = []
+    dr_values  = []
+
+    for i in range(NUM_QUERY):
+        ret_id = returned_ids[i]
+        gt_id  = gt_top1[i]
+        q_vec  = xq[i]
+
+        # MRR: GT 배열에서 반환 벡터 순위
+        gt_row   = gt[i]
+        rank_pos = np.where(gt_row == ret_id)[0]
+        rank     = int(rank_pos[0]) + 1 if len(rank_pos) > 0 else len(gt_row) + 1
+        mrr_values.append(1.0 / rank)
+
+        # Distance Ratio: 실제 L2 거리 기준
+        d_ret = float(np.sum((q_vec - base10m[ret_id]) ** 2))
+        d_gt  = float(np.sum((q_vec - base10m[gt_id])  ** 2))
+        dr    = (d_gt / d_ret) if d_ret > 1e-12 else 1.0
+        dr_values.append(min(dr, 1.0))
+
+    mrr_values = np.array(mrr_values, dtype=np.float64)
+    dr_values  = np.array(dr_values,  dtype=np.float64)
+    mrr        = float(mrr_values.mean())
+    dr         = float(dr_values.mean())
+
+    print(f"    - Recall@1        : {recall_at_1:.4f}")
+    print(f"    - MRR             : {mrr:.4f}")
+    print(f"    - Distance Ratio  : {dr:.4f}")
+
+    mrr_hist = histogram_counts(mrr_values, BINS)
+    dr_hist  = histogram_counts(dr_values,  BINS)
+
+    # -------------------------------------------------------------------------
+    # Step 5. JSON 저장
+    # -------------------------------------------------------------------------
+    total_end    = time.perf_counter()
+    total_ms     = (total_end - total_start) * 1000
+    search_total = float(search_latencies.sum())
+    rerank_total = float(rerank_latencies.sum())
+
+    results = {
+        "name": NAME,
+        "creation_date": CREATION_DATE,
+        "eval_fold": EVAL_FOLD,
+        "query_range": [Q_START, Q_END - 1],
+        "num_query": NUM_QUERY,
+        "candidates": CANDIDATES,
+        "latency": {
+            "total_ms":                    round(total_ms, 3),
+            "query_search_total_ms":       round(search_total, 3),
+            "query_search_avg_ms":         round(float(search_latencies.mean()), 6),
+            "query_search_min_ms":         round(float(search_latencies.min()), 6),
+            "query_search_max_ms":         round(float(search_latencies.max()), 6),
+            "re_ranking_total_ms":         round(rerank_total, 3),
+            "re_ranking_avg_ms":           round(float(rerank_latencies.mean()), 6),
+            "re_ranking_min_ms":           round(float(rerank_latencies.min()), 6),
+            "re_ranking_max_ms":           round(float(rerank_latencies.max()), 6),
+        },
+        "disk_io": {
+            "index_load_bytes":            io_index_bytes,
+            "search_and_reranking_bytes":  io_search_total,
+            "total_io_bytes":              io_index_bytes + io_search_total,
+        },
+        "memory_mb": {
+            "before_index_load":           round(mem_before_index, 2),
+            "after_index_load":            round(mem_after_index, 2),
+            "index_load_delta":            round(mem_after_index - mem_before_index, 2),
+            "after_search":                round(mem_after_search, 2),
+            "search_delta":                round(mem_after_search - mem_before_search, 2),
+            "peak":                        round(mem_peak, 2),
+        },
+        "metrics": {
+            "recall_at_1":                 round(recall_at_1, 6),
+            "mrr":                         round(mrr, 6),
+            "distance_ratio":              round(dr, 6),
+        },
+        "histogram": {
+            "mrr":            mrr_hist,
+            "distance_ratio": dr_hist,
+        }
+    }
+
+    os.makedirs(METRIC_DIR, exist_ok=True)
+    with open(METRIC_PATH, "w") as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+
+    # 쿼리별 T_IO 저장 (평균 없이 쿼리 순서 그대로)
+    timings = {
+        "name": NAME,
+        "creation_date": CREATION_DATE,
+        "eval_fold": EVAL_FOLD,
+        "query_range": [Q_START, Q_END - 1],
+        "num_query": NUM_QUERY,
+        "description": {
+            "T_IO": "base10m 접근 + L2 계산 시간 (ms); all re-ranking이므로 모든 쿼리에 실제 값 존재"
+        },
+        "per_query": [
+            {"query_idx": Q_START + i, "T_IO": t_io_list[i]}
+            for i in range(NUM_QUERY)
+        ]
+    }
+    with open(TIMINGS_PATH, "w") as f:
+        json.dump(timings, f, indent=2, ensure_ascii=False)
+
+    print(f"\n    ✓ Saved: {METRIC_PATH}")
+    print(f"    ✓ Saved: {TIMINGS_PATH}")
+
+    print("\n" + "=" * 70)
+    print("[결과 요약]")
+    print(f"  Total Latency              : {total_ms:.1f} ms")
+    print(f"  PQ Search (avg)            : {float(search_latencies.mean()):.4f} ms")
+    print(f"  Re-ranking (avg)           : {float(rerank_latencies.mean()):.4f} ms")
+    print(f"  I/O - Index Load           : {io_index_bytes:,} bytes")
+    print(f"  I/O - Search + Re-ranking  : {io_search_total:,} bytes")
+    print(f"  Mem - Index Load Delta     : {mem_after_index - mem_before_index:.1f} MB")
+    print(f"  Recall@1                   : {recall_at_1:.4f}")
+    print(f"  MRR                        : {mrr:.4f}")
+    print(f"  Distance Ratio             : {dr:.4f}")
+    print("=" * 70)

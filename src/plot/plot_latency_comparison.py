@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-plot_latency_comparison.py
-───────────────────────────
+plot_latency_comparison_v1.py
+───────────────────────────────────────────────────────────────────────
 output/metric/ 의 3개 JSON 파일에서 latency를 읽어
 그룹 막대 그래프(ms 단위)로 비교합니다.
 

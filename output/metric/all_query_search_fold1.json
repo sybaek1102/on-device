@@ -9,28 +9,28 @@
   "num_query": 1000,
   "candidates": 16,
   "latency": {
-    "total_ms": 45374.218,
-    "query_search_total_ms": 40682.673,
-    "query_search_avg_ms": 40.682673,
-    "query_search_min_ms": 40.019994,
-    "query_search_max_ms": 48.756862,
-    "re_ranking_total_ms": 4211.042,
-    "re_ranking_avg_ms": 4.211042,
-    "re_ranking_min_ms": 0.524978,
-    "re_ranking_max_ms": 7.909417
+    "total_ms": 44984.694,
+    "query_search_total_ms": 40459.962,
+    "query_search_avg_ms": 40.459962,
+    "query_search_min_ms": 39.908063,
+    "query_search_max_ms": 59.293917,
+    "re_ranking_total_ms": 4154.846,
+    "re_ranking_avg_ms": 4.154846,
+    "re_ranking_min_ms": 0.535153,
+    "re_ranking_max_ms": 8.873722
   },
   "disk_io": {
-    "index_load_bytes": 162541568,
+    "index_load_bytes": 162603008,
     "search_and_reranking_bytes": 3328446464,
-    "total_io_bytes": 3490988032
+    "total_io_bytes": 3491049472
   },
   "memory_mb": {
-    "before_index_load": 101.03,
-    "after_index_load": 254.03,
+    "before_index_load": 100.39,
+    "after_index_load": 253.39,
     "index_load_delta": 153.0,
-    "after_search": 1131.78,
-    "search_delta": 877.75,
-    "peak": 5399.55
+    "after_search": 1130.89,
+    "search_delta": 877.5,
+    "peak": 5399.6
   },
   "metrics": {
     "recall_at_1": 0.915,

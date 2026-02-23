@@ -2,8 +2,10 @@
 """
 plot_metrics_comparison.py
 ──────────────────────────
-output/metric/ 의 3개 JSON 파일에서 metrics를 읽어
+output/metric/ 의 4개 JSON 파일에서 metrics를 읽어
 그룹 막대 그래프로 비교합니다.
+
+[순서] no → all → no_same_quality → selective (proposed)
 
 [저장]
   output/graph/metrics_comparison_fold{EVAL_FOLD}.png
@@ -24,23 +26,33 @@ METRIC_DIR = "/home/syback/vectorDB/on-device/output/metric"
 GRAPH_DIR  = "/home/syback/vectorDB/on-device/output/graph"
 
 JSON_FILES = {
-    "no":        os.path.join(METRIC_DIR, f"no_query_search_fold{EVAL_FOLD}.json"),
-    "selective": os.path.join(METRIC_DIR, f"selective_query_search_fold{EVAL_FOLD}.json"),
-    "all":       os.path.join(METRIC_DIR, f"all_query_search_fold{EVAL_FOLD}.json"),
+    "no":           os.path.join(METRIC_DIR, f"no_query_search_fold{EVAL_FOLD}.json"),
+    "all":          os.path.join(METRIC_DIR, f"all_query_search_fold{EVAL_FOLD}.json"),
+    "no_same":      os.path.join(METRIC_DIR, f"no_same_quality_query_search_fold{EVAL_FOLD}.json"),
+    "all_same":     os.path.join(METRIC_DIR, f"all_same_quality_query_search_fold{EVAL_FOLD}.json"),
+    "selective":    os.path.join(METRIC_DIR, f"selective_query_search_fold{EVAL_FOLD}.json"),
+    "selective_res": os.path.join(METRIC_DIR, f"selective_query_search_res_fold{EVAL_FOLD}.json"),
 }
 
-# 모델별 색상 (같은 모델 = 같은 색)
 COLORS = {
-    "no":        "#4C72B0",   # 파란계열
-    "selective": "#DD8452",   # 주황계열
-    "all":       "#55A868",   # 초록계열
+    "no":            "#D9D9D9",  # 연회색
+    "all":           "#D9D9D9",  # 연회색
+    "no_same":       "#777777",  # 중간회색
+    "all_same":      "#777777",  # 중간회색
+    "selective":     "#8B1E2A",  # 딝레드 (proposed M=16)
+    "selective_res": "#8B1E2A",  # 딝레드 (proposed M=32, 동일)
 }
 
 LABELS = {
-    "no":        "No Re-ranking",
-    "selective": "Proposed",
-    "all":       "All Re-ranking",
+    "no":            "No Re-ranking (M=16)",
+    "all":           "All Re-ranking (M=16)",
+    "no_same":       "No Re-ranking (M=32)",
+    "all_same":      "All Re-ranking (M=32)",
+    "selective":     "Proposed (M=16)",
+    "selective_res": "Proposed (M=32)",
 }
+
+MODELS = ["no", "all", "no_same", "all_same", "selective", "selective_res"]   # 그래프 순서
 
 METRIC_KEYS  = ["recall_at_1", "mrr", "distance_ratio"]
 METRIC_NAMES = ["Recall@1",    "MRR", "Distance Ratio"]
@@ -57,42 +69,42 @@ if __name__ == "__main__":
         with open(path) as f:
             data[name] = json.load(f)
 
-    models = ["no", "all", "selective"]   # no → all → proposed
-    n_models  = len(models)
+    n_models  = len(MODELS)
     n_metrics = len(METRIC_KEYS)
 
-    x = np.arange(n_metrics)          # 메트릭별 x 위치
-    bar_width = 0.22
-    offsets   = np.linspace(-(n_models - 1) / 2, (n_models - 1) / 2, n_models) * bar_width
+    x         = np.arange(n_metrics)
+    bar_width  = 0.11
+    offsets    = np.linspace(-(n_models - 1) / 2, (n_models - 1) / 2, n_models) * (bar_width + 0.01)
 
-    fig, ax = plt.subplots(figsize=(9, 5))
+    fig, ax = plt.subplots(figsize=(14, 5))
 
-    for i, model in enumerate(models):
+    for i, model in enumerate(MODELS):
         values = [data[model]["metrics"][k] for k in METRIC_KEYS]
         bars = ax.bar(
             x + offsets[i], values,
             width=bar_width,
             color=COLORS[model],
             label=LABELS[model],
-            edgecolor="white",
+            edgecolor="gray",
             linewidth=0.8,
             zorder=3,
         )
         # 막대 위 수치 표시
         for bar, val in zip(bars, values):
+            txt_color = "white" if model == "selective" else "#444444"
             ax.text(
                 bar.get_x() + bar.get_width() / 2,
-                bar.get_height() + 0.012,
+                bar.get_height() + 0.010,
                 f"{val:.4f}",
                 ha="center", va="bottom",
-                fontsize=8.5, fontweight="bold",
+                fontsize=8, fontweight="bold",
                 color="#333333",
             )
 
     # 축 / 레이아웃
     ax.set_xticks(x)
     ax.set_xticklabels(METRIC_NAMES, fontsize=12)
-    ax.set_ylim(0, 1.12)
+    ax.set_ylim(0, 1.14)
     ax.set_ylabel("Score", fontsize=11)
     ax.set_title(
         f"Metrics Comparison — Fold {EVAL_FOLD}  (Query {(EVAL_FOLD-1)*1000}~{EVAL_FOLD*1000-1})",
@@ -100,7 +112,7 @@ if __name__ == "__main__":
     )
     ax.yaxis.grid(True, linestyle="--", alpha=0.6, zorder=0)
     ax.set_axisbelow(True)
-    ax.legend(fontsize=10, loc="lower right", framealpha=0.9)
+    ax.legend(fontsize=9.5, loc="lower right", framealpha=0.9)
     ax.spines[["top", "right"]].set_visible(False)
 
     plt.tight_layout()

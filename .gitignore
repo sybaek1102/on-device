@@ -208,3 +208,6 @@ __marimo__/
 
 # Project-specific: Raw data files
 data/raw/
+
+# Project-specific: Large index files
+data/index/2026022007_hnswpq.index

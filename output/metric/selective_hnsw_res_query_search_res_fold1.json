@@ -1,0 +1,66 @@
+{
+  "name": "selective_hnsw_res",
+  "creation_date": "2026022007",
+  "eval_fold": 1,
+  "query_range": [
+    0,
+    999
+  ],
+  "num_query": 1000,
+  "candidates": 16,
+  "reranked_queries": 658,
+  "reranked_ratio": 0.658,
+  "latency": {
+    "total_ms": 7960.684,
+    "query_search_total_ms": 849.239,
+    "query_search_avg_ms": 0.849239,
+    "mlp_pipeline_total_ms": 544.94,
+    "mlp_pipeline_avg_ms": 0.54494,
+    "re_ranking_total_ms": 3106.249,
+    "re_ranking_avg_ms": 3.106249
+  },
+  "disk_io": {
+    "index_load_bytes": 3048693760,
+    "search_and_mlp_bytes": 2613108736,
+    "total_io_bytes": 5661802496
+  },
+  "memory_mb": {
+    "before_index_load": 488.47,
+    "after_index_load": 3394.22,
+    "index_load_delta": 2905.75,
+    "after_search": 4317.46,
+    "search_delta": 612.55,
+    "peak": 11742.56
+  },
+  "metrics": {
+    "recall_at_1": 0.826,
+    "mrr": 0.900425,
+    "distance_ratio": 0.989348
+  },
+  "histogram": {
+    "mrr": {
+      "<=0.1": 1,
+      "<=0.2": 15,
+      "<=0.3": 23,
+      "<=0.4": 56,
+      "<=0.5": 174,
+      "<=0.6": 174,
+      "<=0.7": 174,
+      "<=0.8": 174,
+      "<=0.9": 174,
+      "<=1.0": 1000
+    },
+    "distance_ratio": {
+      "<=0.1": 0,
+      "<=0.2": 0,
+      "<=0.3": 0,
+      "<=0.4": 0,
+      "<=0.5": 0,
+      "<=0.6": 0,
+      "<=0.7": 0,
+      "<=0.8": 4,
+      "<=0.9": 36,
+      "<=1.0": 1000
+    }
+  }
+}

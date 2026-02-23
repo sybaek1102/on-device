@@ -1,29 +1,19 @@
 #!/usr/bin/env python3
 """
-query_search_selective_re-ranking.py
-──────────────────────────────────────
-Selective Re-ranking: MLP 모델이 re-ranking 필요 여부를 판단한 뒤,
-필요한 경우에만 실제 L2 거리로 re-ranking을 수행합니다.
+query_search_selective_re-ranking_res_index_hnsw.py
+───────────────────────────────────────────────────
+Selective Re-ranking (HNSW + Residual Index 버전):
+HNSWPQ Index로 K_LARGE 후보를 추출 후 Base+Residual 보정 거리로 top-16 선정,
+MLP 판단 후 필요시 L2 re-ranking을 수행합니다.
 
-[OOF (Out-of-Fold) Inference 방식]
-  - 10,000 쿼리를 1,000개씩 10구간으로 분할
-  - 구간 k (0~9) 의 쿼리에는 fold k+1 모델만 사용
-  - fold k 모델은 학습 시 해당 구간 쿼리를 validation set으로 사용
-  - 모델 10개는 시작 시 한 번만 로드, 루프 내 인덱스 전환만 수행
-    → 루프 중 추가 I/O/메모리 peak 없이 all/no 와 공평한 비교 가능
-
-[파이프라인 (쿼리 1개)]
-  1. PQ Search → top-16 candidates (D, I)
-  2. Residual Feature 계산 (16 candidates × 16 subspaces × 9 dims)
-  3. 해당 fold의 Residual MLP → pred_dot(Q-P, X-P) per candidate
-  4. residual_norm_sq에서 ||X-P||² 조회
-  5. residual_dist = ||X-P||² - 2·pred_dot
-  6. 해당 fold의 Re-ranking MLP (fold별 scaler 적용) → 0 or 1
-  7. 결과가 1 → base10M.fvecs에서 실제 L2 re-ranking
-     결과가 0 → PQ top-1 그대로 반환
+[수정 사항 (vs query_search_selective_re-ranking_res_index.py)]
+  - HNSWPQ index  : {CREATION_DATE}_hnswpq.index  (efSearch 설정 필요)
+  - Residual Index: {CREATION_DATE}_residual_pq_hnsw.index
+  - PQ codes 접근: faiss.downcast_index(hnsw_index.storage).codes
+  - 모델 경로  : data/model/residual_hnsw / re-ranking_hnsw
 
 [저장]
-  output/metric/{name}_query_search.json
+  output/metric/{name}_query_search_res.json
 """
 
 import faiss
@@ -40,15 +30,13 @@ import subprocess
 # =============================================================================
 # 🔹 Configuration
 # =============================================================================
-CREATION_DATE = "2026022007"
-NAME          = "selective"
-THRESHOLD     = 0.5      # re-ranking MLP 임계값
+CREATION_DATE  = "2026022007"
+NAME           = "selective_hnsw_res"
+THRESHOLD      = 0.5      # re-ranking MLP 임계값
+HNSW_EF_SEARCH = 64       # HNSW 검색 품질
 
 # =============================================================================
 # 🔹 K-Fold 평가 설정
-#    EVAL_FOLD : 1~10 중 하나를 지정하면 해당 fold의 쿼리 구간(1,000개)만 실행
-#                → all / no 스크립트와 동일 쿼리셋으로 공평한 비교 가능
-#                → selective는 해당 fold 모델만 사용 (OOF: 학습 미포함 보장)
 # =============================================================================
 EVAL_FOLD  = 1           # 1~10 (1-indexed)
 NUM_FOLDS  = 10
@@ -59,17 +47,18 @@ GT_FILE    = os.path.join(DATA_DIR, "gnd", "idx_10M.ivecs")
 
 BASE10M_FILE = "/home/syback/vectorDB/on-device/data/raw/bigann_base10M.fvecs"
 
-INDEX_DIR        = "/home/syback/vectorDB/on-device/data/index"
-PQ_INDEX_PATH    = os.path.join(INDEX_DIR, f"{CREATION_DATE}_pq.index")
-RES_INDEX_PATH   = os.path.join(INDEX_DIR, f"{CREATION_DATE}_residual_pq.index")
+INDEX_DIR         = "/home/syback/vectorDB/on-device/data/index"
+HNSW_INDEX_PATH   = os.path.join(INDEX_DIR, f"{CREATION_DATE}_hnswpq.index")
+RES_INDEX_PATH    = os.path.join(INDEX_DIR, f"{CREATION_DATE}_residual_pq_hnsw.index")
 
-RESIDUAL_NORM_SQ_PATH = f"/home/syback/vectorDB/on-device/data/features/{CREATION_DATE}_residual_norm_sq.npz"
+RESIDUAL_NORM_SQ_PATH = f"/home/syback/vectorDB/on-device/data/features/{CREATION_DATE}_residual_norm_sq_hnsw.npz"
 
-RESIDUAL_MODEL_DIR  = "/home/syback/vectorDB/on-device/data/model/residual"
-RERANKING_MODEL_DIR = "/home/syback/vectorDB/on-device/data/model/re-ranking"
+RESIDUAL_MODEL_DIR  = "/home/syback/vectorDB/on-device/data/model/residual_hnsw"
+RERANKING_MODEL_DIR = "/home/syback/vectorDB/on-device/data/model/re-ranking_hnsw"
 
-METRIC_DIR  = "/home/syback/vectorDB/on-device/output/metric"
-METRIC_PATH = os.path.join(METRIC_DIR, f"{NAME}_query_search_fold{EVAL_FOLD}.json")
+METRIC_DIR    = "/home/syback/vectorDB/on-device/output/metric"
+METRIC_PATH   = os.path.join(METRIC_DIR, f"{NAME}_query_search_res_fold{EVAL_FOLD}.json")
+TIMINGS_PATH  = os.path.join(METRIC_DIR, f"{NAME}_query_timings_res_fold{EVAL_FOLD}.json")
 
 NUM_QUERY_TOTAL = 10_000
 QUERIES_PER_FOLD = NUM_QUERY_TOTAL // NUM_FOLDS   # 1,000
@@ -77,13 +66,14 @@ Q_START   = (EVAL_FOLD - 1) * QUERIES_PER_FOLD    # inclusive
 Q_END     = EVAL_FOLD * QUERIES_PER_FOLD           # exclusive
 NUM_QUERY = QUERIES_PER_FOLD                       # 이번 실행에서 처리할 쿼리 수
 
-CANDIDATES    = 16
+K_LARGE       = 256      # Base PQ에서 1차로 넉넉하게 추출할 후보 수 (추가됨)
+CANDIDATES    = 16       # 최종 정제하여 MLP에 넘길 후보 수
 DIM           = 128
 NUM_SUBSPACES = 16
 SUB_DIM       = DIM // NUM_SUBSPACES
 
 # =============================================================================
-# 🔹 Model Definitions (훈련 코드와 동일한 구조 필수)
+# 🔹 Model Definitions
 # =============================================================================
 FEATURE_DIM_RES  = 9
 SHARED_HIDDEN    = 32
@@ -205,10 +195,10 @@ if __name__ == "__main__":
     # -------------------------------------------------------------------------
     print("\n>>> [1/6] 데이터 로드 중...")
     print(f"    - EVAL_FOLD : {EVAL_FOLD}  (쿼리 {Q_START}~{Q_END-1}, {NUM_QUERY}개)")
-    xq_all  = load_bvecs(QUERY_FILE, Q_END)   # Q_END 까지만 읽기
-    xq      = xq_all[Q_START:]                # (NUM_QUERY, 128)
+    xq_all  = load_bvecs(QUERY_FILE, Q_END)   
+    xq      = xq_all[Q_START:]                
     gt_all  = load_ivecs(GT_FILE)
-    gt      = gt_all[Q_START:Q_END]           # (NUM_QUERY, k_gt)
+    gt      = gt_all[Q_START:Q_END]           
     gt_top1 = gt[:, 0]
     del xq_all, gt_all
     print(f"    - Query : {xq.shape}")
@@ -216,7 +206,7 @@ if __name__ == "__main__":
 
     # Residual Norm Squared 전체 로드 (10M)
     with np.load(RESIDUAL_NORM_SQ_PATH) as f:
-        res_norm_sq_all = f["residual_norm_sq"].astype(np.float32)  # (10M,)
+        res_norm_sq_all = f["residual_norm_sq"].astype(np.float32)  
     print(f"    - ResNormSq : {res_norm_sq_all.shape}")
 
     # -------------------------------------------------------------------------
@@ -225,13 +215,14 @@ if __name__ == "__main__":
     print("\n>>> [2/6] OS 페이지 캐시 비우기...")
     drop_cache()
 
-    print("\n    PQ / Residual PQ Index 로드 중...")
+    print("\n    HNSW / Residual PQ Index 로드 중...")
     io_before_index  = get_io_bytes()
     mem_before_index = get_rss_mb()
     idx_load_start   = time.perf_counter()
 
-    pq_index  = faiss.read_index(PQ_INDEX_PATH)
-    res_index = faiss.read_index(RES_INDEX_PATH)
+    hnsw_index = faiss.read_index(HNSW_INDEX_PATH)
+    hnsw_index.hnsw.efSearch = HNSW_EF_SEARCH
+    res_index  = faiss.read_index(RES_INDEX_PATH)
 
     idx_load_end    = time.perf_counter()
     io_after_index  = get_io_bytes()
@@ -242,23 +233,23 @@ if __name__ == "__main__":
     print(f"    - Load time       : {index_load_ms:.1f} ms")
     print(f"    - I/O (index)     : {io_index_bytes:,} bytes")
     print(f"    - Mem delta       : +{mem_after_index - mem_before_index:.1f} MB")
+    print(f"    - efSearch        : {HNSW_EF_SEARCH}")
 
-    # PQ / Residual PQ Centroid 추출
-    pq_obj  = faiss.downcast_index(pq_index).pq
-    res_obj = faiss.downcast_index(res_index).pq
+    # HNSWPQ: storage = IndexPQ → downcast 후 pq 접근
+    hnsw_storage = faiss.downcast_index(hnsw_index.storage)   # IndexPQ
+    pq_obj       = hnsw_storage.pq
+    res_obj      = faiss.downcast_index(res_index).pq
     M_pq    = pq_obj.M; K_pq = pq_obj.ksub; dsub = pq_obj.dsub
     pq_centroids  = faiss.vector_to_array(pq_obj.centroids).reshape(M_pq, K_pq, dsub)
     res_centroids = faiss.vector_to_array(res_obj.centroids).reshape(M_pq, K_pq, dsub)
 
-    # PQ / Residual PQ codes 전체를 numpy 배열로 미리 추출 (10M × 16)
-    # → 루프마다 base10m에 접근할 필요 없이 cand_ids 인덱싱만
-    pq_codes_all  = faiss.vector_to_array(
-        faiss.downcast_index(pq_index).codes
-    ).reshape(pq_index.ntotal, M_pq).copy()   # (10M, 16)  uint8
+    # HNSW storage.codes 에서 PQ codes 추출 (10M × 16)
+    pq_codes_all  = faiss.vector_to_array(hnsw_storage.codes
+        ).reshape(hnsw_index.ntotal, M_pq).copy()   # (10M, 16) uint8
     res_codes_all = faiss.vector_to_array(
         faiss.downcast_index(res_index).codes
-    ).reshape(res_index.ntotal, M_pq).copy()  # (10M, 16)  uint8
-    print(f"    - PQ codes   : {pq_codes_all.shape}  (index에서 추출, base10m I/O 없음)")
+    ).reshape(res_index.ntotal, M_pq).copy()        # (10M, 16) uint8
+    print(f"    - PQ codes   : {pq_codes_all.shape}  (HNSW storage 에서 추출)")
     print(f"    - Res codes  : {res_codes_all.shape}")
 
     # -------------------------------------------------------------------------
@@ -268,36 +259,30 @@ if __name__ == "__main__":
 
     residual_models  = []
     reranking_models = []
-    scalers          = []   # (f1_mean, f1_std, f2_mean, f2_std) per fold
+    scalers          = []   
 
     for k in range(1, NUM_FOLDS + 1):
-        # Residual MLP
         m_res = ResidualDistancePredictor().to(DEVICE)
         m_res.load_state_dict(torch.load(
             os.path.join(RESIDUAL_MODEL_DIR, f"model_k{k}.pt"), map_location=DEVICE))
         m_res.eval()
         residual_models.append(m_res)
 
-        # Re-ranking MLP
         m_rer = SimpleMLP().to(DEVICE)
         m_rer.load_state_dict(torch.load(
             os.path.join(RERANKING_MODEL_DIR, f"model_k{k}.pt"), map_location=DEVICE))
         m_rer.eval()
         reranking_models.append(m_rer)
 
-        # Scaler 파라미터
         sc = np.load(os.path.join(RERANKING_MODEL_DIR, f"scaler_k{k}.npz"))
         scalers.append((sc["f1_mean"], sc["f1_std"], sc["f2_mean"], sc["f2_std"]))
 
-    # EVAL_FOLD에 해당하는 모델/scaler만 선택 (단일 fold inference)
     m_res_eval = residual_models[EVAL_FOLD - 1]
     m_rer_eval = reranking_models[EVAL_FOLD - 1]
     f1_mean, f1_std, f2_mean, f2_std = scalers[EVAL_FOLD - 1]
-    print(f"    - Residual  MLP : fold {EVAL_FOLD} 사용 (학습 미포함 구간)")
+    print(f"    - Residual  MLP : fold {EVAL_FOLD} 사용")
     print(f"    - Re-ranking MLP: fold {EVAL_FOLD} 사용")
-    print(f"    - Scaler        : fold {EVAL_FOLD} scaler 사용")
 
-    # Base10M memmap
     base10m = open_fvecs_memmap(BASE10M_FILE)
     print(f"    - Base10M       : {base10m.shape}  (memmap)")
 
@@ -307,10 +292,12 @@ if __name__ == "__main__":
     print(f"\n>>> [4/6] 쿼리 {NUM_QUERY}개 순차 처리 중...")
 
     search_latencies  = []
-    mlp_latencies     = []      # residual MLP + re-ranking MLP
-    rerank_latencies  = []      # 실제 L2 re-ranking (수행 시에만)
+    mlp_latencies     = []      
+    rerank_latencies  = []      
     returned_ids      = []
-    rerank_flags      = []      # 실제로 re-ranking 수행 여부
+    rerank_flags      = []      
+    t_mlp_list        = []      
+    t_io_list         = []      
 
     io_before = get_io_bytes()
     mem_before_search = get_rss_mb()
@@ -319,75 +306,107 @@ if __name__ == "__main__":
         q     = xq[i : i + 1]   # (1, 128)
         q_vec = xq[i]           # (128,)
 
-        # ── PQ Search → top-16 ──────────────────────────────────────────────
+        # ── [HNSW] K_LARGE 후보 추출 → Residual 보정 → Top-16 ──────────────
         t_s = time.perf_counter()
-        D_pq, I = pq_index.search(q, CANDIDATES)   # D: (1,16), I: (1,16)
+        
+        # 1. HNSW로 넉넉하게 후보(K_LARGE) 추출
+        D_base, I_base = hnsw_index.search(q, K_LARGE)   # (1, 256)
+        cand_ids_large = I_base[0]
+        dists_base_large = D_base[0]
+
+        # 2. 선택된 K_LARGE 후보들에 대해 (Base + Residual) 벡터와의 실제 L2 거리 근사치 계산
+        pq_codes_large  = pq_codes_all[cand_ids_large]     # (256, 16)
+        res_codes_large = res_codes_all[cand_ids_large]    # (256, 16)
+
+        refined_dists = np.zeros(K_LARGE, dtype=np.float32)
+        
+        for m in range(NUM_SUBSPACES):
+            s = m * SUB_DIM; e = (m + 1) * SUB_DIM
+            q_sub = q_vec[s:e]                             # (8,)
+            
+            # 각 후보의 m번째 subspace에서의 base와 residual centroid 매핑
+            p_sub = pq_centroids[m][pq_codes_large[:, m]]  # (256, 8)
+            r_sub = res_centroids[m][res_codes_large[:, m]]# (256, 8)
+            
+            # Base와 Residual을 합친 근사 복원 벡터
+            approx_sub = p_sub + r_sub                     # (256, 8)
+            
+            # 쿼리와 근사 복원 벡터 간의 거리 누적
+            refined_dists += np.sum((q_sub - approx_sub) ** 2, axis=1)
+
+        # 3. 보정된 거리를 기준으로 오름차순 정렬하여 최종 Top-16(CANDIDATES) 추출
+        best_indices = np.argsort(refined_dists)[:CANDIDATES]
+        
+        cand_ids = cand_ids_large[best_indices]       # (16,)
+        
+        # [주의] MLP 피처 유지: 
+        # MLP 분포 안정을 위해 보정된 거리가 아닌 원래의 Base PQ 거리를 전달
+        pq_dists = dists_base_large[best_indices]     # (16,)
+
         t_e = time.perf_counter()
         search_latencies.append((t_e - t_s) * 1000)
-
-        cand_ids = I[0]           # (16,)
-        pq_dists = D_pq[0]       # (16,) ||Q-P||²
 
         # ── MLP 파이프라인 ──────────────────────────────────────────────────
         t_m0 = time.perf_counter()
 
         # [A] Residual Feature 계산: (16 candidates, 16 subspaces, 9 dims)
-        #     index에서 미리 추출한 codes를 바로 인덱싱 → base10m I/O 제로
-        pq_codes_cand  = pq_codes_all[cand_ids]    # (16, 16)
-        res_codes_cand = res_codes_all[cand_ids]   # (16, 16)
+        pq_codes_cand  = pq_codes_all[cand_ids]    
+        res_codes_cand = res_codes_all[cand_ids]   
 
-        feat_list = []   # 16 subspaces
+        feat_list = []   
         for m in range(NUM_SUBSPACES):
             s = m * SUB_DIM; e = (m + 1) * SUB_DIM
-            Q_sub  = np.tile(q_vec[s:e], (CANDIDATES, 1))           # (16, 8)
-            P_sub  = pq_centroids[m][pq_codes_cand[:, m]]           # (16, 8)
-            diff_v = Q_sub - P_sub                                   # (16, 8)
-            res_r  = res_centroids[m][res_codes_cand[:, m]]         # (16, 8)
-            prod   = diff_v * res_r                                  # (16, 8)
-            norm_r = np.sqrt(np.sum(res_r ** 2, axis=1, keepdims=True)) / np.sqrt(SUB_DIM)  # (16,1)
-            feat_list.append(np.hstack([prod, norm_r]))             # (16, 9)
+            Q_sub  = np.tile(q_vec[s:e], (CANDIDATES, 1))           
+            P_sub  = pq_centroids[m][pq_codes_cand[:, m]]           
+            diff_v = Q_sub - P_sub                                   
+            res_r  = res_centroids[m][res_codes_cand[:, m]]         
+            prod   = diff_v * res_r                                  
+            norm_r = np.sqrt(np.sum(res_r ** 2, axis=1, keepdims=True)) / np.sqrt(SUB_DIM)  
+            feat_list.append(np.hstack([prod, norm_r]))             
 
-        # (CANDIDATES, NUM_SUBSPACES, 9) = (16, 16, 9)
         feat_tensor = torch.tensor(
             np.stack(feat_list, axis=1), dtype=torch.float32)
 
-        # [B] EVAL_FOLD 모델로 pred_dot 계산: (16,)
+        # [B] EVAL_FOLD 모델로 pred_dot 계산
         with torch.no_grad():
-            pred_dot = m_res_eval(feat_tensor).numpy().flatten()   # (16,)
+            pred_dot = m_res_eval(feat_tensor).numpy().flatten()   
 
         # [C] residual_dist = ||X-P||² - 2 * pred_dot
-        xp_norm_sq    = res_norm_sq_all[cand_ids]                # (16,)
-        residual_dist = xp_norm_sq - 2.0 * pred_dot             # (16,)
+        xp_norm_sq    = res_norm_sq_all[cand_ids]                
+        residual_dist = xp_norm_sq - 2.0 * pred_dot             
 
-        # [D] Re-ranking MLP feature: [pq_dists(16) || residual_dist(16)] = (32,)
-        feat32 = np.hstack([pq_dists, residual_dist])           # (32,)
+        # [D] Re-ranking MLP feature
+        feat32 = np.hstack([pq_dists, residual_dist])           
 
-        # EVAL_FOLD scaler 적용
         feat32_f1 = (feat32[:16] - f1_mean) / (f1_std + 1e-8)
         feat32_f2 = (feat32[16:] - f2_mean) / (f2_std + 1e-8)
         feat32_scaled = np.hstack([feat32_f1, feat32_f2]).astype(np.float32)
 
-        feat32_t = torch.tensor(feat32_scaled).unsqueeze(0)     # (1, 32)
+        feat32_t = torch.tensor(feat32_scaled).unsqueeze(0)     
 
-        # [E] EVAL_FOLD Re-ranking MLP → binary prediction
+        # [E] EVAL_FOLD Re-ranking MLP 
         with torch.no_grad():
             prob = m_rer_eval(feat32_t).item()
 
         t_m1 = time.perf_counter()
-        mlp_latencies.append((t_m1 - t_m0) * 1000)
+        t_mlp_ms = (t_m1 - t_m0) * 1000
+        mlp_latencies.append(t_mlp_ms)
+        t_mlp_list.append(round(t_mlp_ms, 6))
 
         # ── Re-ranking 결정 ──────────────────────────────────────────────────
         if prob >= THRESHOLD:
-            # 실제 L2 re-ranking
             t_r0 = time.perf_counter()
-            cand_vecs = base10m[cand_ids]                          # (16, 128)
+            cand_vecs = base10m[cand_ids]                          
             dists     = np.sum((cand_vecs - q_vec) ** 2, axis=1)
             best      = int(cand_ids[np.argmin(dists)])
             t_r1 = time.perf_counter()
-            rerank_latencies.append((t_r1 - t_r0) * 1000)
+            t_io_ms = (t_r1 - t_r0) * 1000
+            rerank_latencies.append(t_io_ms)
+            t_io_list.append(round(t_io_ms, 6))
             rerank_flags.append(1)
         else:
-            best = int(cand_ids[0])   # PQ top-1 그대로
+            best = int(cand_ids[0])   
+            t_io_list.append(0.0)
             rerank_flags.append(0)
 
         returned_ids.append(best)
@@ -465,7 +484,7 @@ if __name__ == "__main__":
             "mlp_pipeline_total_ms":       round(float(mlp_latencies.sum()), 3),
             "mlp_pipeline_avg_ms":         round(float(mlp_latencies.mean()), 6),
             "re_ranking_total_ms":         round(float(rerank_lat_arr.sum()), 3),
-            "re_ranking_avg_ms":           round(float(rerank_lat_arr.mean()), 6) if len(rerank_latencies) else 0,
+            "re_ranking_avg_ms":           round(float(rerank_lat_arr.sum()) / NUM_QUERY, 6) if n_reranked > 0 else 0,
         },
         "disk_io": {
             "index_load_bytes":            io_index_bytes,
@@ -495,14 +514,34 @@ if __name__ == "__main__":
     with open(METRIC_PATH, "w") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
 
+    timings = {
+        "name": NAME,
+        "creation_date": CREATION_DATE,
+        "eval_fold": EVAL_FOLD,
+        "query_range": [Q_START, Q_END - 1],
+        "num_query": NUM_QUERY,
+        "description": {
+            "T_mlp": "Residual MLP + Re-ranking MLP 파이프라인 시간 (ms), 쿼리당 1개",
+            "T_IO":  "실제 base10m I/O + L2 계산 시간 (ms); Re-ranking MLP가 0 예측 시 0.0"
+        },
+        "per_query": [
+            {"query_idx": Q_START + i, "T_mlp": t_mlp_list[i], "T_IO": t_io_list[i]}
+            for i in range(NUM_QUERY)
+        ]
+    }
+    with open(TIMINGS_PATH, "w") as f:
+        json.dump(timings, f, indent=2, ensure_ascii=False)
+
     print(f"\n    ✓ Saved: {METRIC_PATH}")
+    print(f"    ✓ Saved: {TIMINGS_PATH}")
 
     print("\n" + "=" * 70)
     print("[결과 요약]")
     print(f"  Total Latency              : {total_ms:.1f} ms")
     print(f"  PQ Search (avg)            : {float(search_latencies.mean()):.4f} ms")
     print(f"  MLP 파이프라인 (avg)       : {float(mlp_latencies.mean()):.4f} ms")
-    print(f"  L2 Re-ranking (avg)        : {rerank_lat_arr.mean():.4f} ms")
+    if len(rerank_latencies):
+        print(f"  L2 Re-ranking (avg)        : {rerank_lat_arr.mean():.4f} ms")
     print(f"  Re-ranking 수행 비율       : {n_reranked}/{NUM_QUERY} ({n_reranked/NUM_QUERY*100:.1f}%)")
     print(f"  I/O - Index Load           : {io_index_bytes:,} bytes")
     print(f"  I/O - Search+MLP+Rerank    : {io_search_total:,} bytes")

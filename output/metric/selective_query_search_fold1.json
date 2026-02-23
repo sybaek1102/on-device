@@ -11,26 +11,26 @@
   "reranked_queries": 820,
   "reranked_ratio": 0.82,
   "latency": {
-    "total_ms": 52168.776,
-    "query_search_total_ms": 40727.863,
-    "query_search_avg_ms": 40.727863,
-    "mlp_pipeline_total_ms": 770.417,
-    "mlp_pipeline_avg_ms": 0.770417,
-    "re_ranking_total_ms": 120.164,
-    "re_ranking_avg_ms": 0.146541
+    "total_ms": 45782.475,
+    "query_search_total_ms": 40314.133,
+    "query_search_avg_ms": 40.314133,
+    "mlp_pipeline_total_ms": 789.158,
+    "mlp_pipeline_avg_ms": 0.789158,
+    "re_ranking_total_ms": 3754.348,
+    "re_ranking_avg_ms": 3.754348
   },
   "disk_io": {
-    "index_load_bytes": 49983488,
-    "search_and_mlp_bytes": 0,
-    "total_io_bytes": 49983488
+    "index_load_bytes": 322732032,
+    "search_and_mlp_bytes": 3019354112,
+    "total_io_bytes": 3342086144
   },
   "memory_mb": {
-    "before_index_load": 488.78,
-    "after_index_load": 794.28,
+    "before_index_load": 488.47,
+    "after_index_load": 793.97,
     "index_load_delta": 305.5,
-    "after_search": 1846.52,
-    "search_delta": 741.5,
-    "peak": 9133.49
+    "after_search": 1845.6,
+    "search_delta": 741.0,
+    "peak": 9133.53
   },
   "metrics": {
     "recall_at_1": 0.874,
