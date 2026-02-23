@@ -1,0 +1,66 @@
+{
+  "name": "all",
+  "creation_date": "2026022007",
+  "eval_fold": 1,
+  "query_range": [
+    0,
+    999
+  ],
+  "num_query": 1000,
+  "candidates": 16,
+  "latency": {
+    "total_ms": 45374.218,
+    "query_search_total_ms": 40682.673,
+    "query_search_avg_ms": 40.682673,
+    "query_search_min_ms": 40.019994,
+    "query_search_max_ms": 48.756862,
+    "re_ranking_total_ms": 4211.042,
+    "re_ranking_avg_ms": 4.211042,
+    "re_ranking_min_ms": 0.524978,
+    "re_ranking_max_ms": 7.909417
+  },
+  "disk_io": {
+    "index_load_bytes": 162541568,
+    "search_and_reranking_bytes": 3328446464,
+    "total_io_bytes": 3490988032
+  },
+  "memory_mb": {
+    "before_index_load": 101.03,
+    "after_index_load": 254.03,
+    "index_load_delta": 153.0,
+    "after_search": 1131.78,
+    "search_delta": 877.75,
+    "peak": 5399.55
+  },
+  "metrics": {
+    "recall_at_1": 0.915,
+    "mrr": 0.952956,
+    "distance_ratio": 0.995902
+  },
+  "histogram": {
+    "mrr": {
+      "<=0.1": 2,
+      "<=0.2": 5,
+      "<=0.3": 8,
+      "<=0.4": 19,
+      "<=0.5": 85,
+      "<=0.6": 85,
+      "<=0.7": 85,
+      "<=0.8": 85,
+      "<=0.9": 85,
+      "<=1.0": 1000
+    },
+    "distance_ratio": {
+      "<=0.1": 0,
+      "<=0.2": 0,
+      "<=0.3": 0,
+      "<=0.4": 0,
+      "<=0.5": 0,
+      "<=0.6": 0,
+      "<=0.7": 0,
+      "<=0.8": 2,
+      "<=0.9": 9,
+      "<=1.0": 1000
+    }
+  }
+}

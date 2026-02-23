@@ -1,0 +1,14 @@
+{
+  "version": "2026022007",
+  "base_pq": {
+    "train_time_ms": 10072.449,
+    "add_time_ms": 11197.8,
+    "total_time_ms": 21270.249
+  },
+  "residual_pq": {
+    "train_time_ms": 15038.414,
+    "add_time_ms": 11220.102,
+    "total_time_ms": 26258.515
+  },
+  "total_build_time_ms": 47528.764
+}
